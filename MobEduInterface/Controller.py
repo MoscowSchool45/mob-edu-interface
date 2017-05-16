@@ -1,13 +1,29 @@
 import requests
 import json
 
+debug = True
+
 
 class UserExists(Exception):
     pass
 
 
+class ClassExists(Exception):
+    pass
+
+
 class UserDoesNotExist(Exception):
     pass
+
+
+class RequestFailedException(Exception):
+    def __init__(self, code, response=None):
+        super(RequestFailedException, self).__init__()
+        self.code = code
+        self.response = response
+
+    def __str__(self):
+        return "RequestFailedException(code={})".format(self.code)
 
 
 class Controller(object):
@@ -16,6 +32,10 @@ class Controller(object):
     account_url = '/api/account'
     users_url = '/adm/users'
     user_detail_url = '/adm/users/{user[id]}'
+    classes_url = '/adm/classes/'
+    class_url = '/api/learningClasses/'
+    class_detail_url = '/api/learningClasses/{e_class[id]}'
+    school_url = '/adm/schools'
 
     default_user_mappings = {
         ('firstName', 'givenName'),
@@ -29,7 +49,11 @@ class Controller(object):
         ('id', 'id'),
     }
 
-    preset_user_attributes = {
+    default_class_mappings = {
+        ('name', lambda x: " ".join(x['eline-division-name'].split(" ")[0:2])),
+        ('parallel', lambda x: int(x['eline-division-name'].split(" ")[0])),
+        ('letter', lambda x: x['eline-division-name'].split(" ")[1]),
+        ('id', 'id'),
     }
 
     def __init__(self, url):
@@ -38,6 +62,7 @@ class Controller(object):
         self.account = None
         self.managed_school = None
         self.user_list = []
+        self.school_list = []
 
     def set_managed_school(self, school_id):
         if school_id in self.managed_school_list:
@@ -45,79 +70,83 @@ class Controller(object):
         else:
             raise ValueError()
 
-    def _get_user_list(self):
-        current_url = self.url + type(self).users_url
-
+    def _get_json(self, current_url, alt=None):
         response = requests.get(
             current_url,
             cookies=self.cookies,
         )
-
-        try:
-            self.user_list = json.loads(response.text)
-        except json.decoder.JSONDecodeError:
-            pass
-
-    def _get_user_detail(self, user):
-        current_url = self.url + type(self).user_detail_url.format(user=user)
-
-        response = requests.get(
-            current_url,
-            cookies=self.cookies,
-        )
-
         try:
             return json.loads(response.text)
         except json.decoder.JSONDecodeError:
-            return {}
+            return alt
+
+    def _get_user_list(self):
+        self.user_list = self._get_json(self.url + type(self).users_url, [])
+
+    def _get_school_list(self):
+        self.school_list = self._get_json(self.url + type(self).school_url, [])
+
+    def _get_user_detail(self, user):
+        return self._get_json(self.url + type(self).user_detail_url.format(user=user))
+
+    def _get_class_detail(self, e_class):
+        return self._get_json(self.url + type(self).class_detail_url.format(e_class=e_class))
+
+    def _request_json_object(self, url, obj, method):
+        if obj is not None:
+            response = method(
+                url,
+                cookies=self.cookies,
+                json=obj
+            )
+        else:
+            response = method(
+                url,
+                cookies=self.cookies,
+            )
+
+        if response.status_code == 200:
+            return True
+        else:
+            raise RequestFailedException(code=response.status_code, response=response)
 
     def _post_json_object(self, url, obj):
-        response = requests.post(
-            url,
-            cookies=self.cookies,
-            json=obj
-        )
-
-        if response.status_code == 200:
-            return True
-        else:
-            return False
+        return self._request_json_object(url, obj, requests.post)
 
     def _put_json_object(self, url, obj):
-        response = requests.put(
-            url,
-            cookies=self.cookies,
-            json=obj
-        )
+        return self._request_json_object(url, obj, requests.put)
 
-        if response.status_code == 200:
-            return True
-        else:
-            return False
+    def _delete_object(self, url):
+        return self._request_json_object(url, None, requests.delete)
 
-    def _make_user(self, user, mappings=None):
-        if mappings is None:
-            mappings = type(self).default_user_mappings
+    @classmethod
+    def _map_object(cls, original_obj, mappings):
         obj = {}
         for remote, local in mappings:
-            if local in user:
-                obj[remote]=user[local]
+            if callable(local):
+                obj[remote] = local(original_obj)
+            elif local in original_obj:
+                obj[remote] = original_obj[local]
         return obj
 
-    def create_user(self, user, mappings=None):
-        obj = self._make_user(user, mappings)
+    def create_user(self, user):
+        obj = type(self)._map_object(user, type(self).default_user_mappings)
         if obj['login'] in self.login_list:
             raise UserExists()
         obj['schoolId'] = self.managed_school
         current_url = self.url + type(self).users_url
-        if self._post_json_object(current_url, obj):
+        try:
+            self._post_json_object(current_url, obj)
             self._get_user_list()
             return True
-        else:
-            return False
+        except RequestFailedException as e:
+            if e.code == 409:
+                raise UserExists()
+            else:
+                return False
 
-    def update_user(self, user, mappings=None):
-        obj = self._make_user(user, mappings)
+    def update_user(self, user):
+        obj = type(self)._map_object(user, type(self).default_user_mappings)
         if obj['login'] not in self.login_list:
             raise UserDoesNotExist()
         cached_obj = self.user_for_login(obj['login'])
@@ -127,10 +156,62 @@ class Controller(object):
                 obj[attr] = old_obj[attr]
         obj['schoolId'] = self.managed_school
         current_url = self.url + type(self).users_url
-        if self._put_json_object(current_url, obj):
+        try:
+            self._put_json_object(current_url, obj)
             self._get_user_list()
             return True
-        else:
+        except RequestFailedException as e:
+            return False
+
+    def delete_user(self, user):
+        obj = type(self)._map_object(user, type(self).default_user_mappings)
+        if obj['login'] not in self.login_list:
+            raise UserDoesNotExist()
+        cached_obj = self.user_for_login(obj['login'])
+        current_url = self.url + type(self).user_detail_url.format(user=cached_obj)
+        try:
+            self._delete_object(current_url)
+            self._get_user_list()
+            return True
+        except RequestFailedException as e:
+            return False
+
+    def create_class(self, e_class):
+        obj = type(self)._map_object(e_class, type(self).default_class_mappings)
+        obj['school'] = self.managed_school_detail
+        current_url = self.url + type(self).class_url
+        try:
+            self._post_json_object(current_url, obj)
+            return True
+        except RequestFailedException as e:
+            if e.response is not None \
+                    and 'Error_code' in e.response.headers \
+                    and e.response.headers['Error_code'] == '2500':
+                raise ClassExists()
+            return False
+
+    def update_class(self, e_class, mappings=None):
+        obj = type(self)._map_object(e_class, type(self).default_class_mappings)
+        old_obj = self._get_class_detail(e_class=obj)
+        for attr in old_obj:
+            if attr not in obj:
+                obj[attr] = old_obj[attr]
+        obj['school'] = self.managed_school_detail
+        current_url = self.url + type(self).class_url
+        try:
+            self._put_json_object(current_url, obj)
+            return True
+        except RequestFailedException as e:
+            return False
+
+    def delete_class(self, e_class):
+        obj = type(self)._map_object(e_class, type(self).default_class_mappings)
+        old_obj = self._get_class_detail(e_class=obj)
+        current_url = self.url + type(self).class_detail_url.format(e_class=old_obj)
+        try:
+            self._delete_object(current_url)
+            return True
+        except RequestFailedException as e:
             return False
 
     def authenticate(self, username, password):
@@ -174,6 +255,7 @@ class Controller(object):
         try:
             self.account = json.loads(response.text)
             self._get_user_list()
+            self._get_school_list()
             if len(self.managed_school_list) == 1:
                 self.set_managed_school(self.managed_school_list[0])
             return True
@@ -195,6 +277,13 @@ class Controller(object):
             return [x['id'] for x in self.account['additionalUserInfoDTO']['adminSchools']]
         else:
             return []
+
+    @property
+    def managed_school_detail(self):
+        for school in self.school_list:
+            if school['id'] == self.managed_school:
+                return school
+        return {}
 
     def user_for_login(self, login):
         if login not in self.login_list:
