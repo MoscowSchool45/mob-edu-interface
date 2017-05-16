@@ -1,8 +1,6 @@
 import requests
 import json
 
-debug = True
-
 
 class UserExists(Exception):
     pass
@@ -13,6 +11,10 @@ class ClassExists(Exception):
 
 
 class UserDoesNotExist(Exception):
+    pass
+
+
+class OperationalError(Exception):
     pass
 
 
@@ -31,11 +33,15 @@ class Controller(object):
     auth_url = '/api/authenticate'
     account_url = '/api/account'
     users_url = '/adm/users'
+    user_url = users_url
     user_detail_url = '/adm/users/{user[id]}'
-    classes_url = '/adm/classes/'
-    class_url = '/api/learningClasses/'
+    classes_url = '/adm/classes'
+    class_url = '/api/learningClasses'
     class_detail_url = '/api/learningClasses/{e_class[id]}'
     school_url = '/adm/schools'
+    groups_url = '/api/userGroups'
+    group_url = groups_url
+    group_detail_url = '/api/userGroups/{group[id]}'
 
     default_user_mappings = {
         ('firstName', 'givenName'),
@@ -50,9 +56,14 @@ class Controller(object):
     }
 
     default_class_mappings = {
+        ('name', lambda x: " ".join(x['eline-division-name'].split(" ")[0:2]) if 'eline-division-name' in x else None),
+        ('parallel', lambda x: int(x['eline-division-name'].split(" ")[0]) if 'eline-division-name' in x else None),
+        ('letter', lambda x: x['eline-division-name'].split(" ")[1] if 'eline-division-name' in x else None),
+        ('id', 'id'),
+    }
+
+    default_group_mappings = {
         ('name', lambda x: " ".join(x['eline-division-name'].split(" ")[0:2])),
-        ('parallel', lambda x: int(x['eline-division-name'].split(" ")[0])),
-        ('letter', lambda x: x['eline-division-name'].split(" ")[1]),
         ('id', 'id'),
     }
 
@@ -106,7 +117,7 @@ class Controller(object):
             )
 
         if response.status_code == 200:
-            return True
+            return response
         else:
             raise RequestFailedException(code=response.status_code, response=response)
 
@@ -120,13 +131,17 @@ class Controller(object):
         return self._request_json_object(url, None, requests.delete)
 
     @classmethod
-    def _map_object(cls, original_obj, mappings):
+    def _map_object(cls, original_obj, mappings, old_obj=None):
         obj = {}
         for remote, local in mappings:
             if callable(local):
                 obj[remote] = local(original_obj)
             elif local in original_obj:
                 obj[remote] = original_obj[local]
+        if old_obj is not None:
+            for attr in old_obj:
+                if attr not in obj:
+                    obj[attr] = old_obj[attr]
         return obj
 
     def create_user(self, user):
@@ -134,7 +149,7 @@ class Controller(object):
         if obj['login'] in self.login_list:
             raise UserExists()
         obj['schoolId'] = self.managed_school
-        current_url = self.url + type(self).users_url
+        current_url = self.url + type(self).user_url
         try:
             self._post_json_object(current_url, obj)
             self._get_user_list()
@@ -155,7 +170,7 @@ class Controller(object):
             if attr not in obj:
                 obj[attr] = old_obj[attr]
         obj['schoolId'] = self.managed_school
-        current_url = self.url + type(self).users_url
+        current_url = self.url + type(self).user_url
         try:
             self._put_json_object(current_url, obj)
             self._get_user_list()
@@ -177,18 +192,47 @@ class Controller(object):
             return False
 
     def create_class(self, e_class):
+        # Now this probably requires at least some explanation
+        #
+        # We have two entities in mobedu - classes, and groups
+        # You can only have one group for each class
+        # You can't have a group without a class
+        # You can have a class without a group,
+        # but there's no point since mapping students to a class is done with groups
+        #
+        # This is why we always create a group after creating the class,
+        # and we always delete a group after deleting the class
+
+        # Create a class
         obj = type(self)._map_object(e_class, type(self).default_class_mappings)
         obj['school'] = self.managed_school_detail
         current_url = self.url + type(self).class_url
         try:
-            self._post_json_object(current_url, obj)
-            return True
+            response = self._post_json_object(current_url, obj)
         except RequestFailedException as e:
             if e.response is not None \
                     and 'Error_code' in e.response.headers \
                     and e.response.headers['Error_code'] == '2500':
                 raise ClassExists()
             return False
+
+        try:
+            obj = json.loads(response.text)
+        except json.decoder.JSONDecodeError:
+            return False
+
+        # Class created and stored as obj, now try to create a user_group
+        group_obj = type(self)._map_object(e_class, type(self).default_group_mappings)
+        group_obj["learningClassId"] = obj['id']
+
+        current_url = self.url + type(self).group_url
+        try:
+            self._post_json_object(current_url, group_obj)
+        except RequestFailedException as e:
+            raise OperationalError
+
+        # Insanity and courage! It worked.
+        return True
 
     def update_class(self, e_class, mappings=None):
         obj = type(self)._map_object(e_class, type(self).default_class_mappings)
@@ -200,9 +244,22 @@ class Controller(object):
         current_url = self.url + type(self).class_url
         try:
             self._put_json_object(current_url, obj)
-            return True
         except RequestFailedException as e:
             return False
+
+        # Now update the group for consistency
+        current_url = self.url + type(self).group_url
+
+        group_obj = type(self)._map_object(e_class, type(self).default_group_mappings)
+        group_obj["learningClassId"] = obj['id']
+        group_obj['id'] = \
+            self._get_json(self.url + type(self).group_detail_url.format(group=old_obj['userGroup']))['id']
+        try:
+            self._put_json_object(current_url, group_obj)
+        except RequestFailedException as e:
+            raise OperationalError
+
+        return True
 
     def delete_class(self, e_class):
         obj = type(self)._map_object(e_class, type(self).default_class_mappings)
@@ -210,9 +267,19 @@ class Controller(object):
         current_url = self.url + type(self).class_detail_url.format(e_class=old_obj)
         try:
             self._delete_object(current_url)
-            return True
         except RequestFailedException as e:
             return False
+
+        group_obj = self._get_json(self.url + type(self).group_detail_url.format(group=old_obj['userGroup']))
+
+        current_url = self.url + type(self).group_detail_url.format(group=group_obj)
+
+        try:
+            self._delete_object(current_url)
+        except RequestFailedException as e:
+            raise OperationalError
+
+        return True
 
     def authenticate(self, username, password):
         """Authenticate user, set account attribute.
