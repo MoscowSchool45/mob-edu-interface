@@ -32,27 +32,32 @@ class Controller(object):
     root_url = '/'
     auth_url = '/api/authenticate'
     account_url = '/api/account'
-    users_url = '/adm/users'
-    user_url = users_url
+    users_url = '/adm/users?per_page=100&disabled=True&activated=True&page={n}'
+    user_url = '/adm/users'
     user_detail_url = '/adm/users/{user[id]}'
-    classes_url = '/adm/classes'
+    classes_url = '/adm/classes?per_page=100&page={n}'
     class_url = '/api/learningClasses'
     class_detail_url = '/api/learningClasses/{e_class[id]}'
     school_url = '/adm/schools'
     groups_url = '/api/userGroups'
     group_url = groups_url
     group_detail_url = '/api/userGroups/{group[id]}'
+    activate_user_url = '/adm/users/activate'
+
+    default_student_roles = ["ROLE_STUDENT"]
+    default_teacher_roles = ["ROLE_TEACHER"]
 
     default_user_mappings = {
         ('firstName', 'givenName'),
         ('lastName', 'sn'),
         ('middleName', 'secondName'),
         ('email', 'cms-email'),
-        ('login', 'cn'),
+        ('login', lambda x: "{}@ms45.edu.ru".format(x['cn'])),
         ('password', 'password'),
         ('roles', 'roles'),
         ('schoolId', 'schoolId'),
         ('id', 'id'),
+        ('active', lambda x: True if 'loginDisabled' not in x or not x['loginDisabled'] else False),
     }
 
     default_class_mappings = {
@@ -74,6 +79,9 @@ class Controller(object):
         self.managed_school = None
         self.user_list = []
         self.school_list = []
+        self.class_list = []
+        self.teacher_roles = type(self).default_teacher_roles
+        self.student_roles = type(self).default_student_roles
 
     def set_managed_school(self, school_id):
         if school_id in self.managed_school_list:
@@ -92,7 +100,26 @@ class Controller(object):
             return alt
 
     def _get_user_list(self):
-        self.user_list = self._get_json(self.url + type(self).users_url, [])
+        n = 1
+        self.user_list = []
+        while True:
+            current = self._get_json(self.url + type(self).users_url.format(n=n), [])
+            self.user_list += current
+            if len(current) == 0:
+                break
+            else:
+                n+=1
+
+    def _get_class_list(self):
+        n = 1
+        self.class_list = []
+        while True:
+            current = self._get_json(self.url + type(self).classes_url.format(n=n), [])
+            self.class_list += current
+            if len(current) == 0:
+                break
+            else:
+                n+=1
 
     def _get_school_list(self):
         self.school_list = self._get_json(self.url + type(self).school_url, [])
@@ -144,15 +171,24 @@ class Controller(object):
                     obj[attr] = old_obj[attr]
         return obj
 
-    def create_user(self, user):
+    def create_user(self, user, teacher=False, skip_update=False):
         obj = type(self)._map_object(user, type(self).default_user_mappings)
         if obj['login'] in self.login_list:
             raise UserExists()
         obj['schoolId'] = self.managed_school
+        if 'roles' not in obj:
+            if teacher:
+                obj['roles'] = self.teacher_roles
+            else:
+                obj['roles'] = self.student_roles
         current_url = self.url + type(self).user_url
         try:
+            if 'active' in obj and not obj['active']:
+                # Cowardly refusing to create an inactive user
+                return True
             self._post_json_object(current_url, obj)
-            self._get_user_list()
+            if not skip_update:
+                self._get_user_list()
             return True
         except RequestFailedException as e:
             if e.code == 409:
@@ -173,10 +209,33 @@ class Controller(object):
         current_url = self.url + type(self).user_url
         try:
             self._put_json_object(current_url, obj)
-            self._get_user_list()
-            return True
         except RequestFailedException as e:
             return False
+
+        try:
+            if 'active' in obj:
+                self._put_json_object(self.url +  type(self).activate_user_url,
+                                      {'id': obj['id'], 'activate': obj['active']})
+            return True
+        except RequestFailedException:
+            raise OperationalError
+
+    def set_password(self, login, password):
+        cached_obj = self.user_for_login(login)
+        old_obj = self._get_user_detail(user=cached_obj)
+        obj = {
+            'password': password,
+        }
+        for attr in old_obj:
+            if attr not in obj:
+                obj[attr] = old_obj[attr]
+        obj['schoolId'] = self.managed_school
+        current_url = self.url + type(self).user_url
+        try:
+            self._put_json_object(current_url, obj)
+        except RequestFailedException as e:
+            return False
+
 
     def delete_user(self, user):
         obj = type(self)._map_object(user, type(self).default_user_mappings)
@@ -232,10 +291,20 @@ class Controller(object):
             raise OperationalError
 
         # Insanity and courage! It worked.
+        self._get_class_list()
         return True
 
     def update_class(self, e_class, mappings=None):
         obj = type(self)._map_object(e_class, type(self).default_class_mappings)
+
+        if 'id' not in obj:
+            for entry in self.class_list:
+                if entry['parallel'] == obj['parallel'] and \
+                    entry['letter'] == obj['letter'] and \
+                        ('schoolName' not in obj or obj['schoolName'] == entry['schoolName']):
+                    obj['id'] = entry['id']
+                    break
+
         old_obj = self._get_class_detail(e_class=obj)
         for attr in old_obj:
             if attr not in obj:
@@ -259,6 +328,7 @@ class Controller(object):
         except RequestFailedException as e:
             raise OperationalError
 
+        self._get_class_list()
         return True
 
     def delete_class(self, e_class):
@@ -279,7 +349,79 @@ class Controller(object):
         except RequestFailedException as e:
             raise OperationalError
 
+        self._get_class_list()
         return True
+
+    def get_class_group(self, e_class):
+        obj = type(self)._map_object(e_class, type(self).default_class_mappings)
+
+        if 'id' not in obj:
+            for entry in self.class_list:
+                if entry['parallel'] == obj['parallel'] and \
+                    entry['letter'] == obj['letter'] and \
+                        ('schoolName' not in obj or obj['schoolName'] == entry['schoolName']):
+                    obj['id'] = entry['id']
+                    break
+
+        old_obj = self._get_class_detail(e_class=obj)
+        group_obj = self._get_json(self.url + type(self).group_detail_url.format(group=old_obj['userGroup']))
+
+        if 'userIds' not in group_obj and 'users' in group_obj:
+            group_obj['userIds'] = [x['id'] for x in group_obj['users']]
+
+        return group_obj
+
+    def _get_user_object(self, user):
+        obj = type(self)._map_object(user, type(self).default_user_mappings)
+        if obj['login'] not in self.login_list:
+            raise UserDoesNotExist()
+        cached_obj = self.user_for_login(obj['login'])
+        old_obj = self._get_user_detail(user=cached_obj)
+        return old_obj
+
+    def get_cached_member_id(self, user):
+        obj = type(self)._map_object(user, type(self).default_user_mappings)
+        for entry in self.user_list:
+            if obj['login'] == entry['login']:
+                return entry['id']
+        return None
+
+    def _set_group_members(self, group_obj):
+        current_url = self.url + type(self).groups_url
+
+        new_obj = {"tutorId": group_obj['tutorId'] if 'tutorId' in group_obj else None,
+                   "learningClassId": group_obj['learningClasses'][0]['id'],
+                   "name": group_obj['name'],
+                   "id": group_obj['id'],
+                   "userIds": group_obj['userIds']}
+        try:
+            self._put_json_object(current_url, new_obj)
+        except RequestFailedException as e:
+            raise OperationalError
+
+    def set_class_members(self, e_class, user_ids):
+        group_obj = self.get_class_group(e_class)
+        group_obj['userIds'] = user_ids
+
+        self._set_group_members(group_obj)
+
+    def add_class_member(self, e_class, user):
+        group_obj = self.get_class_group(e_class)
+        user_obj = self._get_user_object(user)
+
+        if user not in group_obj['userIds']:
+            group_obj['userIds'].append(user_obj['id'])
+
+        self._set_group_members(group_obj)
+
+    def remove_class_member(self, e_class, user):
+        group_obj = self.get_class_group(e_class)
+        user_obj = self._get_user_object(user)
+
+        if user_obj['id'] in group_obj['userIds']:
+            group_obj['userIds'] = [x for x in group_obj['userIds'] if x != user_obj['id']]
+
+        self._set_group_members(group_obj)
 
     def authenticate(self, username, password):
         """Authenticate user, set account attribute.
@@ -322,6 +464,7 @@ class Controller(object):
         try:
             self.account = json.loads(response.text)
             self._get_user_list()
+            self._get_class_list()
             self._get_school_list()
             if len(self.managed_school_list) == 1:
                 self.set_managed_school(self.managed_school_list[0])
